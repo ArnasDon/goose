@@ -66,13 +66,20 @@ impl ProviderMessage {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ProviderModelConfig {
     pub model_name: String,
+    #[uniffi(default = None)]
     pub context_limit: Option<u64>,
+    #[uniffi(default = None)]
     pub temperature: Option<f32>,
+    #[uniffi(default = None)]
     pub max_tokens: Option<i32>,
+    #[uniffi(default = false)]
     pub toolshim: bool,
+    #[uniffi(default = None)]
     pub toolshim_model: Option<String>,
     /// Provider-specific request parameters as a JSON object string.
+    #[uniffi(default = None)]
     pub request_params_json: Option<String>,
+    #[uniffi(default = None)]
     pub reasoning: Option<bool>,
 }
 

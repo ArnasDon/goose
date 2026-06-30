@@ -1,7 +1,5 @@
+#!/usr/bin/env -S uv run --script
 """Goose SDK demo: build a declarative provider and stream a completion."""
-
-from __future__ import annotations
-
 import json
 import sys
 from pathlib import Path
@@ -20,16 +18,7 @@ from aaif_goose import (  # noqa: E402
 def main() -> None:
     provider_json = (HERE.parent.parent.parent / "goose-providers" / "examples" / "deepseek.json").read_text()
     provider = DeclarativeProvider.from_json(provider_json)
-    model = ProviderModelConfig(
-        model_name="deepseek-v4-flash",
-        context_limit=None,
-        temperature=None,
-        max_tokens=None,
-        toolshim=False,
-        toolshim_model=None,
-        request_params_json=None,
-        reasoning=None,
-    )
+    model = ProviderModelConfig(model_name="deepseek-v4-flash")
     messages = [ProviderMessage(role=MessageRole.USER, text="what is the capital of France?")]
     stream = provider.stream(
         model,
