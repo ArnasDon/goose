@@ -5135,6 +5135,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "url",
+ "urlencoding",
  "utoipa 4.2.3",
  "uuid",
  "wiremock",

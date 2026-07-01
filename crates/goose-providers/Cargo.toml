@@ -50,6 +50,7 @@ tokio-stream = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true, features = ["compat"] }
 rand = { workspace = true }
 url = { workspace = true }
+urlencoding = { workspace = true }
 pem = { version = "3.0.2", default-features = false, features = ["std"], optional = true }
 pkcs1 = { version = "0.7.5", default-features = false, features = ["pkcs8", "std"], optional = true }
 pkcs8 = { version = "0.11.0", default-features = false, features = ["alloc", "std"], optional = true }
