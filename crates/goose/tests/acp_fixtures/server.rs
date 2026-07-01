@@ -128,6 +128,11 @@ impl AcpServerConnection {
     }
 
     #[allow(dead_code)]
+    pub fn session_notifications(&self) -> Vec<SessionNotification> {
+        self.updates.lock().unwrap().clone()
+    }
+
+    #[allow(dead_code)]
     pub async fn wait_for_session_update<F>(&self, timeout: Duration, predicate: F) -> bool
     where
         F: Fn(&SessionUpdate) -> bool,
@@ -156,6 +161,39 @@ impl AcpServerConnection {
                     .unwrap()
                     .iter()
                     .any(|notification| predicate(&notification.update));
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn wait_for_session_notification<F>(&self, timeout: Duration, predicate: F) -> bool
+    where
+        F: Fn(&SessionNotification) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .updates
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|notification| predicate(notification))
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if tokio::time::timeout_at(deadline, self.notify.notified())
+                .await
+                .is_err()
+            {
+                return self
+                    .updates
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|notification| predicate(notification));
             }
         }
     }

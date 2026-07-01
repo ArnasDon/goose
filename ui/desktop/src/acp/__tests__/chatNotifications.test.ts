@@ -1,4 +1,5 @@
 import type { SessionNotification } from '@agentclientprotocol/sdk';
+import { waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppEvents } from '../../constants/events';
 import { ChatState } from '../../types/chatState';
@@ -7,6 +8,7 @@ import { maybeHandlePlatformEvent } from '../../utils/platform_events';
 import { handleAcpSessionNotification } from '../chatNotifications';
 import type { AcpChatSessionSnapshot } from '../chatSessionStore';
 import { acpChatSessionActions, acpChatSessionStore } from '../chatSessionStore';
+import { acpFetchSessionConversation } from '../sessions';
 
 vi.mock('../chatSessionStore', () => ({
   acpChatSessionStore: {
@@ -14,12 +16,23 @@ vi.mock('../chatSessionStore', () => ({
   },
   acpChatSessionActions: {
     applyAcpSessionNotification: vi.fn(),
+    applyFetchedConversation: vi.fn(),
     applyAcpGooseSessionNotification: vi.fn(),
+    deleteSnapshot: vi.fn(),
+    startSessionLoad: vi.fn(),
+    finishSessionLoad: vi.fn(),
+    failSessionLoad: vi.fn(),
   },
 }));
 
 vi.mock('../../utils/platform_events', () => ({
   maybeHandlePlatformEvent: vi.fn(),
+}));
+
+vi.mock('../sessions', () => ({
+  acpFetchSessionConversation: vi.fn(),
+  acpLoadSession: vi.fn(),
+  sessionInfoToSession: vi.fn(),
 }));
 
 const SESSION_ID = 'session-1';
@@ -30,6 +43,20 @@ function sessionInfoUpdate(title: string): SessionNotification {
     update: {
       sessionUpdate: 'session_info_update',
       title,
+    },
+  };
+}
+
+function invalidationUpdate(invalidations: string[]): SessionNotification {
+  return {
+    sessionId: SESSION_ID,
+    update: {
+      sessionUpdate: 'session_info_update',
+      _meta: {
+        goose: {
+          invalidations,
+        },
+      },
     },
   };
 }
@@ -86,6 +113,7 @@ function snapshotWithName(name: string): AcpChatSessionSnapshot {
     activePromptAttemptId: null,
     activeRunId: null,
     pendingCancelPromptAttemptId: null,
+    conversationCursor: 0,
   };
 }
 
@@ -107,6 +135,7 @@ function snapshotWithoutSession(): AcpChatSessionSnapshot {
     activePromptAttemptId: null,
     activeRunId: null,
     pendingCancelPromptAttemptId: null,
+    conversationCursor: 0,
   };
 }
 
@@ -181,5 +210,40 @@ describe('handleAcpSessionNotification', () => {
     await handleAcpSessionNotification(platformEventToolUpdate('completed'));
 
     expect(maybeHandlePlatformEvent).not.toHaveBeenCalled();
+  });
+
+  it('deletes the local snapshot for deleted session invalidations', async () => {
+    const dispatchEvent = vi.spyOn(window, 'dispatchEvent');
+
+    await handleAcpSessionNotification(invalidationUpdate(['deleted']));
+
+    expect(acpChatSessionActions.deleteSnapshot).toHaveBeenCalledWith(SESSION_ID);
+    expect(dispatchEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: AppEvents.SESSION_DELETED,
+        detail: { sessionId: SESSION_ID },
+      })
+    );
+  });
+
+  it('fetches conversation deltas for conversation invalidations', async () => {
+    vi.mocked(acpChatSessionStore.getSnapshot).mockReturnValueOnce(snapshotWithName('Existing'));
+    vi.mocked(acpFetchSessionConversation).mockResolvedValueOnce({
+      notifications: [],
+      nextCursor: 3,
+      reset: false,
+    });
+
+    await handleAcpSessionNotification(invalidationUpdate(['conversation']));
+
+    await waitFor(() => {
+      expect(acpFetchSessionConversation).toHaveBeenCalledWith(SESSION_ID, 0);
+      expect(acpChatSessionActions.applyFetchedConversation).toHaveBeenCalledWith(
+        SESSION_ID,
+        [],
+        3,
+        false
+      );
+    });
   });
 });

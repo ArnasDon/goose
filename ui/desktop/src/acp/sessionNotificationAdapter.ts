@@ -14,6 +14,8 @@ import {
   type AdapterState,
   cloneMessage,
   getGooseActiveRunId,
+  getGooseConversationCursor,
+  getGooseMessageCount,
 } from './adapter/shared';
 import { applyToolCall, applyToolCallUpdate } from './adapter/tools';
 import type { AcpElicitationRequest } from './elicitationRequests';
@@ -79,7 +81,14 @@ function applyAcpSessionNotification(
       return applyToolCallUpdate(state, update);
     case 'session_info_update': {
       const activeRunId = getGooseActiveRunId(update);
-      if (!update.title && activeRunId === undefined) {
+      const messageCount = getGooseMessageCount(update);
+      const conversationCursor = getGooseConversationCursor(update);
+      if (
+        !update.title &&
+        activeRunId === undefined &&
+        messageCount === undefined &&
+        conversationCursor === undefined
+      ) {
         return [];
       }
 
@@ -88,6 +97,8 @@ function applyAcpSessionNotification(
           type: 'sessionInfo',
           ...(update.title ? { name: update.title } : {}),
           ...(activeRunId !== undefined ? { activeRunId } : {}),
+          ...(messageCount !== undefined ? { messageCount } : {}),
+          ...(conversationCursor !== undefined ? { conversationCursor } : {}),
         },
       ];
     }

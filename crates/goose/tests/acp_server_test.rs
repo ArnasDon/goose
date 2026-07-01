@@ -3,13 +3,14 @@
 mod common_tests;
 use agent_client_protocol::schema::v1::{
     Annotations, ContentBlock, ListSessionsRequest, ListSessionsResponse, NewSessionRequest,
-    Role as AcpRole, SessionConfigKind, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionInfo, SessionUpdate, SetSessionConfigOptionRequest, TextContent,
+    PromptRequest, Role as AcpRole, SessionConfigKind, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionInfo, SessionUpdate, SetSessionConfigOptionRequest,
+    StopReason, TextContent,
 };
 use agent_client_protocol::ErrorCode;
 use common_tests::fixtures::server::AcpServerConnection;
 use common_tests::fixtures::{
-    run_test, Connection, OpenAiFixture, Session, SessionData, TestConnectionConfig,
+    run_test, send_custom, Connection, OpenAiFixture, Session, SessionData, TestConnectionConfig,
 };
 #[cfg(feature = "code-mode")]
 use common_tests::run_prompt_codemode;
@@ -168,6 +169,53 @@ fn is_active_run_idle_update(update: &SessionUpdate) -> bool {
         .is_some_and(serde_json::Value::is_null)
 }
 
+fn session_info_meta_value<'a>(
+    update: &'a SessionUpdate,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    let SessionUpdate::SessionInfoUpdate(info) = update else {
+        return None;
+    };
+    info.meta.as_ref()?.get(key)
+}
+
+fn session_info_has_invalidation(update: &SessionUpdate, expected: &str) -> bool {
+    session_info_meta_value(update, "goose")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|goose| goose.get("invalidations"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|invalidations| {
+            invalidations
+                .iter()
+                .any(|scope| scope.as_str() == Some(expected))
+        })
+}
+
+fn session_info_title(update: &SessionUpdate) -> Option<String> {
+    let SessionUpdate::SessionInfoUpdate(info) = update else {
+        return None;
+    };
+    serde_json::to_value(info)
+        .ok()?
+        .get("title")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+async fn wait_for_session_notification_update<F>(
+    conn: &AcpServerConnection,
+    session_id: &str,
+    predicate: F,
+) -> bool
+where
+    F: Fn(&SessionUpdate) -> bool,
+{
+    conn.wait_for_session_notification(Duration::from_secs(2), |notification| {
+        notification.session_id.0.as_ref() == session_id && predicate(&notification.update)
+    })
+    .await
+}
+
 #[test]
 fn test_config_mcp() {
     run_test(async { run_config_mcp::<AcpServerConnection>().await });
@@ -187,11 +235,34 @@ fn test_list_sessions() {
 fn test_session_updates_broadcast_between_connections() {
     run_test(async {
         let data_root = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let skill_dir = work_dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review the current task\n---\nReview carefully.",
+        )
+        .unwrap();
+
         let actor_openai = OpenAiFixture::new(
-            vec![(
-                "Cross-client broadcast prompt".to_string(),
-                include_str!("acp_test_data/openai_basic.txt"),
-            )],
+            vec![
+                (
+                    "Cross-client broadcast prompt".to_string(),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+                (
+                    "/unknown-broadcast-command prompt".to_string(),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+                (
+                    "/review please".to_string(),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+            ],
             <AcpServerConnection as Connection>::expected_session_id(),
         )
         .await;
@@ -209,6 +280,7 @@ fn test_session_updates_broadcast_between_connections() {
         let mut actor = <AcpServerConnection as Connection>::new(
             TestConnectionConfig {
                 data_root: data_root_path.clone(),
+                cwd: Some(work_dir),
                 ..Default::default()
             },
             actor_openai,
@@ -235,7 +307,8 @@ fn test_session_updates_broadcast_between_connections() {
             session: mut actor_session,
             ..
         } = actor.new_session().await.unwrap();
-        let session_id = actor_session.session_id().0.to_string();
+        let session_id = actor_session.session_id().clone();
+        let session_id_text = session_id.0.to_string();
         assert!(
             observer
                 .wait_for_session_update(Duration::from_secs(2), |update| matches!(
@@ -255,7 +328,10 @@ fn test_session_updates_broadcast_between_connections() {
             "list-only connection did not receive session_info_update for session/new"
         );
 
-        let _observer_session = observer.load_session(&session_id, vec![]).await.unwrap();
+        let _observer_session = observer
+            .load_session(&session_id_text, vec![])
+            .await
+            .unwrap();
         observer.clear_session_notifications();
         list_only.clear_session_notifications();
 
@@ -311,6 +387,56 @@ fn test_session_updates_broadcast_between_connections() {
                     | SessionUpdate::ToolCallUpdate(_)
             )),
             "list-only connection received content updates: {list_only_updates:#?}"
+        );
+
+        actor.clear_session_notifications();
+        observer.clear_session_notifications();
+
+        let response = actor
+            .cx()
+            .send_request(PromptRequest::new(
+                session_id.clone(),
+                vec![ContentBlock::Text(TextContent::new(
+                    "/unknown-broadcast-command prompt",
+                ))],
+            ))
+            .block_task()
+            .await
+            .unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        assert!(
+            observer
+                .wait_for_session_update(Duration::from_secs(2), |update| {
+                    matches!(update, SessionUpdate::UserMessageChunk(_))
+                        && text_chunk(update) == Some("/unknown-broadcast-command prompt")
+                })
+                .await,
+            "observer did not receive unresolved slash prompt user_message_chunk"
+        );
+
+        actor.clear_session_notifications();
+        observer.clear_session_notifications();
+
+        let response = actor
+            .cx()
+            .send_request(PromptRequest::new(
+                session_id,
+                vec![ContentBlock::Text(TextContent::new("/review please"))],
+            ))
+            .block_task()
+            .await
+            .unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        assert!(
+            observer
+                .wait_for_session_update(Duration::from_secs(2), |update| {
+                    matches!(update, SessionUpdate::UserMessageChunk(_))
+                        && text_chunk(update) == Some("/review please")
+                })
+                .await,
+            "observer did not receive registered skill slash prompt user_message_chunk"
         );
     });
 }
@@ -391,6 +517,203 @@ fn test_prompt_broadcast_filters_assistant_only_content() {
                 .iter()
                 .any(|update| text_chunk(update) == Some("hidden assistant context")),
             "observer received assistant-only prompt content: {updates:#?}"
+        );
+    });
+}
+
+#[test]
+fn test_session_metadata_mutations_broadcast_between_connections() {
+    run_test(async {
+        let data_root = tempfile::tempdir().unwrap();
+        let actor_openai = OpenAiFixture::new(
+            vec![],
+            <AcpServerConnection as Connection>::expected_session_id(),
+        )
+        .await;
+        let observer_openai = OpenAiFixture::new(
+            vec![],
+            <AcpServerConnection as Connection>::expected_session_id(),
+        )
+        .await;
+        let data_root_path = data_root.path().to_path_buf();
+        let mut actor = <AcpServerConnection as Connection>::new(
+            TestConnectionConfig {
+                data_root: data_root_path.clone(),
+                ..Default::default()
+            },
+            actor_openai,
+        )
+        .await;
+        let observer = <AcpServerConnection as Connection>::new(
+            TestConnectionConfig {
+                data_root: data_root_path,
+                ..Default::default()
+            },
+            observer_openai,
+        )
+        .await;
+
+        let SessionData { session, .. } = actor.new_session().await.unwrap();
+        let session_id = session.session_id().0.to_string();
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| matches!(
+                update,
+                SessionUpdate::SessionInfoUpdate(_)
+            ))
+            .await,
+            "observer did not receive initial session info"
+        );
+        observer.clear_session_notifications();
+
+        send_custom(
+            actor.cx(),
+            "_goose/unstable/session/rename",
+            serde_json::json!({
+                "sessionId": session_id.clone(),
+                "title": "Renamed broadcast session",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| {
+                session_info_title(update).as_deref() == Some("Renamed broadcast session")
+            })
+            .await,
+            "observer did not receive rename update"
+        );
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| {
+                session_info_has_invalidation(update, "session_info")
+            })
+            .await,
+            "observer did not receive rename invalidation"
+        );
+        observer.clear_session_notifications();
+
+        send_custom(
+            actor.cx(),
+            "_goose/unstable/session/project/update",
+            serde_json::json!({
+                "sessionId": session_id.clone(),
+                "projectId": "project-broadcast",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| {
+                session_info_meta_value(update, "projectId").and_then(serde_json::Value::as_str)
+                    == Some("project-broadcast")
+            })
+            .await,
+            "observer did not receive project update"
+        );
+        observer.clear_session_notifications();
+
+        let updated_working_dir = tempfile::tempdir().unwrap();
+        send_custom(
+            actor.cx(),
+            "_goose/unstable/session/working-dir/update",
+            serde_json::json!({
+                "sessionId": session_id.clone(),
+                "workingDir": updated_working_dir.path().to_string_lossy().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| {
+                session_info_meta_value(update, "workingDir").and_then(serde_json::Value::as_str)
+                    == Some(updated_working_dir.path().to_string_lossy().as_ref())
+            })
+            .await,
+            "observer did not receive working directory update"
+        );
+        observer.clear_session_notifications();
+
+        send_custom(
+            actor.cx(),
+            "_goose/unstable/session/archive",
+            serde_json::json!({ "sessionId": session_id.clone() }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| {
+                session_info_meta_value(update, "archivedAt").is_some()
+            })
+            .await,
+            "observer did not receive archive update"
+        );
+        observer.clear_session_notifications();
+
+        send_custom(
+            actor.cx(),
+            "_goose/unstable/session/unarchive",
+            serde_json::json!({ "sessionId": session_id.clone() }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| {
+                matches!(update, SessionUpdate::SessionInfoUpdate(_))
+                    && session_info_meta_value(update, "archivedAt").is_none()
+                    && session_info_title(update).as_deref() == Some("Renamed broadcast session")
+            })
+            .await,
+            "observer did not receive unarchive update"
+        );
+        observer.clear_session_notifications();
+
+        let export = send_custom(
+            actor.cx(),
+            "_goose/unstable/session/export",
+            serde_json::json!({ "sessionId": session_id.clone() }),
+        )
+        .await
+        .unwrap();
+        let imported = send_custom(
+            actor.cx(),
+            "_goose/unstable/session/import",
+            serde_json::json!({
+                "input": export["data"],
+                "source": "json",
+            }),
+        )
+        .await
+        .unwrap();
+        let imported_session_id = imported["sessionId"].as_str().unwrap().to_string();
+        assert!(
+            wait_for_session_notification_update(&observer, &imported_session_id, |update| {
+                session_info_title(update).as_deref() == Some("Renamed broadcast session")
+            })
+            .await,
+            "observer did not receive import update"
+        );
+        observer.clear_session_notifications();
+
+        send_custom(
+            actor.cx(),
+            "session/delete",
+            serde_json::json!({ "sessionId": session_id.clone() }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| {
+                session_info_meta_value(update, "deleted").and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            })
+            .await,
+            "observer did not receive delete tombstone update"
+        );
+        assert!(
+            wait_for_session_notification_update(&observer, &session_id, |update| {
+                session_info_has_invalidation(update, "deleted")
+            })
+            .await,
+            "observer did not receive delete invalidation"
         );
     });
 }
@@ -699,6 +1022,7 @@ fn test_get_session_info() {
             .expect("session info should include meta");
         assert!(meta.get("createdAt").and_then(|v| v.as_str()).is_some());
         assert_eq!(meta.get("messageCount"), Some(&serde_json::json!(1)));
+        assert_eq!(meta.get("conversationCursor"), Some(&serde_json::json!(1)));
         assert_eq!(meta.get("userSetName"), Some(&serde_json::json!(false)));
         assert_eq!(meta.get("sessionType"), Some(&serde_json::json!("acp")));
         assert_eq!(meta.get("hasRecipe"), Some(&serde_json::json!(false)));

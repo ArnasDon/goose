@@ -1,43 +1,33 @@
 use super::*;
 
-fn send_replay_content_chunk(
-    cx: &ConnectionTo<Client>,
+fn replay_content_chunk_notification(
     session_id: &SessionId,
     message: &Message,
     content: ContentBlock,
-) -> std::result::Result<(), agent_client_protocol::Error> {
+) -> SessionNotification {
     let chunk = ContentChunk::new(content).meta(replay_message_meta(message));
     let update = match message.role {
         Role::User => SessionUpdate::UserMessageChunk(chunk),
         Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
     };
-    cx.send_notification(SessionNotification::new(session_id.clone(), update))
+    SessionNotification::new(session_id.clone(), update)
 }
 
-fn replay_conversation_to_client(
-    cx: &ConnectionTo<Client>,
-    session: &Session,
-) -> Result<HashMap<String, crate::conversation::message::ToolRequest>, agent_client_protocol::Error>
-{
-    let session_id = SessionId::new(session.id.clone());
-    let sid = sid_short(session_id.0.as_ref());
-
-    let messages = session
-        .conversation
-        .as_ref()
-        .map(|c| c.messages().to_vec())
-        .unwrap_or_default();
-    debug!(
-        target: "perf",
-        sid = %sid,
-        messages = messages.len(),
-            "perf: load_session messages loaded"
-    );
-
+pub(super) fn conversation_replay_notifications(
+    session_id: &SessionId,
+    messages: &[Message],
+) -> Result<
+    (
+        Vec<SessionNotification>,
+        HashMap<String, crate::conversation::message::ToolRequest>,
+    ),
+    agent_client_protocol::Error,
+> {
+    let mut notifications = Vec::new();
     let mut replay_tool_requests =
         HashMap::<String, crate::conversation::message::ToolRequest>::new();
 
-    for message in &messages {
+    for message in messages {
         if !message.metadata.user_visible {
             continue;
         }
@@ -49,7 +39,11 @@ fn replay_conversation_to_client(
                     if let Some(audience) = text.audience() {
                         tc = tc.annotations(acp_audience_annotations(audience));
                     }
-                    send_replay_content_chunk(cx, &session_id, message, ContentBlock::Text(tc))?;
+                    notifications.push(replay_content_chunk_notification(
+                        session_id,
+                        message,
+                        ContentBlock::Text(tc),
+                    ));
                 }
                 MessageContent::Image(image) => {
                     let mut image_content =
@@ -58,12 +52,11 @@ fn replay_conversation_to_client(
                         image_content =
                             image_content.annotations(acp_audience_annotations(audience));
                     }
-                    send_replay_content_chunk(
-                        cx,
-                        &session_id,
+                    notifications.push(replay_content_chunk_notification(
+                        session_id,
                         message,
                         ContentBlock::Image(image_content),
-                    )?;
+                    ));
                 }
                 MessageContent::ToolRequest(tool_request) => {
                     replay_tool_requests.insert(tool_request.id.clone(), tool_request.clone());
@@ -81,10 +74,10 @@ fn replay_conversation_to_client(
                         .tool_call
                         .meta(merge_replay_message_meta(meta, message));
 
-                    cx.send_notification(SessionNotification::new(
+                    notifications.push(SessionNotification::new(
                         session_id.clone(),
                         SessionUpdate::ToolCall(tool_call),
-                    ))?;
+                    ));
                 }
                 MessageContent::ToolResponse(tool_response) => {
                     let status = match &tool_response.tool_result {
@@ -126,13 +119,13 @@ fn replay_conversation_to_client(
                                 extract_tool_call_update_meta(tool_response),
                                 message,
                             ));
-                    cx.send_notification(SessionNotification::new(
+                    notifications.push(SessionNotification::new(
                         session_id.clone(),
                         SessionUpdate::ToolCallUpdate(update),
-                    ))?;
+                    ));
                 }
                 MessageContent::Thinking(thinking) => {
-                    cx.send_notification(SessionNotification::new(
+                    notifications.push(SessionNotification::new(
                         session_id.clone(),
                         SessionUpdate::AgentThoughtChunk(
                             ContentChunk::new(ContentBlock::Text(TextContent::new(
@@ -140,12 +133,41 @@ fn replay_conversation_to_client(
                             )))
                             .meta(replay_message_meta(message)),
                         ),
-                    ))?;
+                    ));
                 }
                 MessageContent::SystemNotification(_) => {}
                 _ => {}
             }
         }
+    }
+
+    Ok((notifications, replay_tool_requests))
+}
+
+fn replay_conversation_to_client(
+    cx: &ConnectionTo<Client>,
+    session: &Session,
+) -> Result<HashMap<String, crate::conversation::message::ToolRequest>, agent_client_protocol::Error>
+{
+    let session_id = SessionId::new(session.id.clone());
+    let sid = sid_short(session_id.0.as_ref());
+
+    let messages = session
+        .conversation
+        .as_ref()
+        .map(|c| c.messages().to_vec())
+        .unwrap_or_default();
+    debug!(
+        target: "perf",
+        sid = %sid,
+            messages = messages.len(),
+                "perf: load_session messages loaded"
+    );
+
+    let (notifications, replay_tool_requests) =
+        conversation_replay_notifications(&session_id, &messages)?;
+    for notification in notifications {
+        cx.send_notification(notification)?;
     }
 
     Ok(replay_tool_requests)

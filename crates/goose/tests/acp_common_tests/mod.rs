@@ -84,6 +84,10 @@ pub async fn run_list_sessions<C: Connection>() {
         "messageCount".to_string(),
         serde_json::Value::Number(2.into()),
     );
+    expected_meta.insert(
+        "conversationCursor".to_string(),
+        serde_json::Value::Number(2.into()),
+    );
     expected_meta.insert("userSetName".to_string(), serde_json::Value::Bool(false));
     expected_meta.insert(
         "sessionType".to_string(),

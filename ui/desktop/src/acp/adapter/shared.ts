@@ -9,6 +9,8 @@ export type AcpChatStateChange =
       type: 'sessionInfo';
       name?: string;
       activeRunId?: string | null;
+      messageCount?: number;
+      conversationCursor?: number;
     }
   | { type: 'localSteerConfirmed'; messageId: string }
   | { type: 'notification'; notification: NotificationEvent };
@@ -75,6 +77,34 @@ export function getGooseActiveRunId(update: { _meta?: unknown }): string | null 
 
   return typeof goose.activeRunId === 'string' || goose.activeRunId === null
     ? goose.activeRunId
+    : undefined;
+}
+
+export function getGooseMessageCount(update: { _meta?: unknown }): number | undefined {
+  if (!isRecord(update._meta)) {
+    return undefined;
+  }
+
+  const goose = update._meta.goose;
+  if (isRecord(goose) && typeof goose.messageCount === 'number') {
+    return goose.messageCount;
+  }
+
+  return typeof update._meta.messageCount === 'number' ? update._meta.messageCount : undefined;
+}
+
+export function getGooseConversationCursor(update: { _meta?: unknown }): number | undefined {
+  if (!isRecord(update._meta)) {
+    return undefined;
+  }
+
+  const goose = update._meta.goose;
+  if (isRecord(goose) && typeof goose.conversationCursor === 'number') {
+    return goose.conversationCursor;
+  }
+
+  return typeof update._meta.conversationCursor === 'number'
+    ? update._meta.conversationCursor
     : undefined;
 }
 
